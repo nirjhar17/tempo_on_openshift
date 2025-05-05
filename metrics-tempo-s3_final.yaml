@@ -8,5 +8,5 @@ stringData:
   access_key_secret: ${AWS_SECRET_ACCESS_KEY}
   bucket:
   endpoint: https://s3.us-east-1.amazonaws.com
-  region: us-east-1
+  # region: us-east-1
 type: Opaque
