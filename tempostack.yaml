@@ -1,0 +1,46 @@
+apiVersion: tempo.grafana.com/v1alpha1
+kind: TempoStack
+metadata:
+  name: sample
+  namespace: tracing-system
+spec:
+  storage:
+    secret:
+      name: metrics-tempo-s3
+      type: s3
+  storageSize: 10Gi
+  resources:
+    total:
+      limits:
+        memory: 2Gi
+        cpu: 2000m
+  template:
+    querier:
+      resources:
+        limits:
+          cpu: "2"
+    queryFrontend:
+      component:
+        resources:
+          limits:
+            memory: 6Gi
+      jaegerQuery:
+        enabled: true
+        monitorTab:
+          enabled: true
+          prometheusEndpoint: http://thanos-querier.openshift-monitoring.svc.cluster.local:9094
+        # NOTE: No ingress here - Gateway provides the UI route
+    # CRITICAL: Gateway must be enabled for OpenShift Traces UI
+    gateway:
+      enabled: true
+      ingress:
+        type: route
+  # CRITICAL: Multi-tenancy is required for OpenShift Traces UI
+  tenants:
+    mode: openshift
+    authentication:
+      - tenantName: dev
+        tenantId: dev
+      - tenantName: prod
+        tenantId: prod
+

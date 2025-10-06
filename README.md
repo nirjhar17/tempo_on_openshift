@@ -1,153 +1,570 @@
-## Tempo with Openshift
-#Main doc :- https://docs.openshift.com/container-platform/4.13/observability/distr_tracing/distr_tracing_tempo/distr-tracing-tempo-configuring.html
+# Distributed Tracing with Tempo on OpenShift
 
-1. Tempo Installation
- -  Install the following operators
-    - Tempo
-    - Open telemetry
-2. Create namespaces tracing-system
+Complete guide to set up distributed tracing using Grafana Tempo, OpenTelemetry, and the new OpenShift Traces UI with multi-tenancy support.
+
+## 📋 Table of Contents
+- [Prerequisites](#prerequisites)
+- [Architecture Overview](#architecture-overview)
+- [Installation Steps](#installation-steps)
+- [Instrumentation Guide](#instrumentation-guide)
+- [Verification & Troubleshooting](#verification--troubleshooting)
+- [References](#references)
+
+---
+
+## Prerequisites
+
+- OpenShift cluster (4.13+)
+- Cluster admin access
+- S3-compatible storage (AWS S3, MinIO, etc.)
+- Basic understanding of OpenTelemetry and distributed tracing
+
+---
+
+## Architecture Overview
+
 ```
+Applications (Python/Java/Node.js/.NET)
+    ↓ (Auto-instrumented via OpenTelemetry)
+    ↓ OTLP (HTTP:4318 or gRPC:4317)
+    ↓
+OpenTelemetry Collector (opentelemetrycollector namespace)
+    ↓ (Bearer Token Auth + RBAC)
+    ↓ OTLP/gRPC (Port 8090)
+    ↓
+Tempo Gateway (tracing-system namespace)
+    ↓ (Multi-tenancy: dev/prod)
+    ↓
+Tempo Distributor → Ingester → S3 Storage
+    ↑
+    └─ Query Frontend ← OpenShift Traces UI
+```
+
+---
+
+## Installation Steps
+
+### Step 1: Install Required Operators
+
+Install the following operators from OperatorHub:
+
+1. **Red Hat build of OpenTelemetry** (openshift-opentelemetry-operator namespace)
+2. **Tempo Operator** (openshift-tempo-operator namespace)
+3. **Cluster Observability Operator** (openshift-cluster-observability-operator namespace)
+
+```bash
+# Wait for operators to be ready
+oc get csv -n openshift-opentelemetry-operator
+oc get csv -n openshift-tempo-operator
+oc get csv -n openshift-cluster-observability-operator
+```
+
+---
+
+### Step 2: Create Namespaces
+
+```bash
+# Create namespace for Tempo
 oc new-project tracing-system
-```
-3. ### Deploy tempostack in the tracing-system namespace
-   ### Create the secret for s3 bucket
-   ### create s3 bucket in AWS and make a secret with access key and secret key
-```
-oc create -f metrics-tempo-s3_final.yaml
-oc create -f tempostack.yaml
-```
 
-4. Create namespace for OpenTelemetry Collector
-```
+# Create namespace for OpenTelemetry Collector
 oc new-project opentelemetrycollector
 ```
 
-5. Create opentelemetry.yaml for metrics and trace collection
-```
-oc create -f OpenTelemetry_new
-```
+---
 
-6. Tempo configuration for prometheus metrics
+### Step 3: Configure Object Storage
 
-### The TempoStack custom resource must specify the following: the Monitor tab is enabled, and the Prometheus endpoint is set to the Thanos querier service to query the data from the user-defined monitoring stack.
-1. Enables the monitoring tab in the Jaeger console.
-2. The service name for Thanos Querier from user-workload monitoring.
-```
-kind:  TempoStack
-apiVersion: tempo.grafana.com/v1alpha1
+#### Option A: AWS S3
+
+Create a secret with your S3 credentials:
+
+```bash
+oc create -f - <<EOF
+apiVersion: v1
+kind: Secret
 metadata:
-  name: simplest
+  name: metrics-tempo-s3
+  namespace: tracing-system
+stringData:
+  endpoint: https://s3.<region>.amazonaws.com
+  bucket: <your-bucket-name>
+  access_key_id: <your-access-key>
+  access_key_secret: <your-secret-key>
+type: Opaque
+EOF
+```
+
+#### Option B: MinIO
+
+```bash
+oc create -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: metrics-tempo-s3
+  namespace: tracing-system
+stringData:
+  endpoint: http://minio.minio.svc.cluster.local:9000
+  bucket: tempo
+  access_key_id: <minio-access-key>
+  access_key_secret: <minio-secret-key>
+type: Opaque
+EOF
+```
+
+---
+
+### Step 4: Deploy TempoStack with Gateway and Multi-tenancy
+
+**🔴 CRITICAL**: The Gateway and multi-tenancy are **REQUIRED** for the OpenShift Traces UI to work!
+
+```bash
+oc create -f - <<EOF
+apiVersion: tempo.grafana.com/v1alpha1
+kind: TempoStack
+metadata:
+  name: sample
+  namespace: tracing-system
 spec:
+  storage:
+    secret:
+      name: metrics-tempo-s3
+      type: s3
+  storageSize: 10Gi
+  resources:
+    total:
+      limits:
+        memory: 2Gi
+        cpu: 2000m
   template:
+    querier:
+      resources:
+        limits:
+          cpu: "2"
     queryFrontend:
+      component:
+        resources:
+          limits:
+            memory: 6Gi
       jaegerQuery:
         enabled: true
         monitorTab:
-          enabled: true  
-          prometheusEndpoint: https://thanos-querier.openshift-monitoring.svc.cluster.local:9091 
-        ingress:
-          type: route
-
+          enabled: true
+          prometheusEndpoint: http://thanos-querier.openshift-monitoring.svc.cluster.local:9094
+    # CRITICAL: Gateway must be enabled for Traces UI
+    gateway:
+      enabled: true
+      ingress:
+        type: route
+  # CRITICAL: Multi-tenancy is required for Traces UI
+  tenants:
+    mode: openshift
+    authentication:
+      - tenantName: dev
+        tenantId: dev
+      - tenantName: prod
+        tenantId: prod
+EOF
 ```
-### 7. Apply the Instrumentation Configuration
+
+**Wait for TempoStack to be ready:**
 
 ```bash
-oc apply -f instrumentation.yaml
+# Watch pods starting up
+oc get pods -n tracing-system -w
+
+# Check TempoStack status
+oc get tempostack sample -n tracing-system
 ```
 
+Expected pods:
+- `tempo-sample-distributor-*`
+- `tempo-sample-ingester-*`
+- `tempo-sample-querier-*`
+- `tempo-sample-query-frontend-*`
+- `tempo-sample-compactor-*`
+- `tempo-sample-gateway-*` ← **Must be present!**
+
+---
+
+### Step 5: Configure RBAC for Multi-tenancy
+
+**🔴 CRITICAL**: Without RBAC, traces cannot be written or read!
+
+#### 5.1: RBAC for Reading Traces (Users in UI)
+
 ```bash
-# Check Instrumentation resource
+oc create -f - <<EOF
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tempostack-traces-reader
+rules:
+- apiGroups:
+  - 'tempo.grafana.com'
+  resources:
+  - dev
+  - prod
+  resourceNames:
+  - traces
+  verbs:
+  - 'get'
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tempostack-traces-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tempostack-traces-reader
+subjects:
+- kind: Group
+  apiGroup: rbac.authorization.k8s.io
+  name: system:authenticated
+EOF
+```
+
+#### 5.2: RBAC for Writing Traces (OTel Collector)
+
+```bash
+oc create -f - <<EOF
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tempostack-traces-write
+rules:
+- apiGroups:
+  - 'tempo.grafana.com'
+  resources:
+  - dev
+  - prod
+  resourceNames:
+  - traces
+  verbs:
+  - 'create'
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tempostack-traces-write
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tempostack-traces-write
+subjects:
+- kind: ServiceAccount
+  name: otel-collector
+  namespace: opentelemetrycollector
+EOF
+```
+
+**Verify RBAC:**
+
+```bash
+oc get clusterrole tempostack-traces-reader tempostack-traces-write
+oc get clusterrolebinding tempostack-traces-reader tempostack-traces-write
+```
+
+---
+
+### Step 6: Deploy OpenTelemetry Collector with Bearer Token Auth
+
+**🔴 CRITICAL**: Bearer token authentication is required for Gateway communication!
+
+```bash
+oc create -f - <<'EOF'
+apiVersion: opentelemetry.io/v1alpha1
+kind: OpenTelemetryCollector
+metadata:
+  name: otel
+  namespace: opentelemetrycollector
+spec:
+  mode: deployment
+  replicas: 1
+  
+  observability:
+    metrics:
+      enableMetrics: true
+  
+  config: |
+    # ========================================
+    # EXTENSIONS - Authentication
+    # ========================================
+    extensions:
+      # Bearer token auth using service account token
+      bearertokenauth:
+        filename: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+    # ========================================
+    # RECEIVERS - Accept traces from apps
+    # ========================================
+    receivers:
+      # OTLP receiver (modern standard)
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+      
+      # Jaeger receiver (for legacy apps)
+      jaeger:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:14250
+          thrift_http:
+            endpoint: 0.0.0.0:14268
+      
+      # Zipkin receiver (for legacy apps)
+      zipkin:
+        endpoint: 0.0.0.0:9411
+
+    # ========================================
+    # PROCESSORS - Process traces
+    # ========================================
+    processors:
+      # Batch traces for efficiency
+      batch:
+        timeout: 10s
+        send_batch_size: 1024
+      
+      # Prevent out-of-memory errors
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 512
+
+    # ========================================
+    # CONNECTORS - Generate metrics from spans
+    # ========================================
+    connectors:
+      spanmetrics:
+        metrics_flush_interval: 15s
+
+    # ========================================
+    # EXPORTERS - Send data to backends
+    # ========================================
+    exporters:
+      # Export traces to Tempo Gateway with authentication
+      otlp:
+        endpoint: "tempo-sample-gateway.tracing-system.svc.cluster.local:8090"
+        tls:
+          # Use OpenShift service CA
+          insecure: false
+          ca_file: "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt"
+        # Bearer token authentication
+        auth:
+          authenticator: bearertokenauth
+        # Tenant header (change to 'prod' if needed)
+        headers:
+          X-Scope-OrgID: "dev"
+      
+      # Export span metrics to Prometheus
+      prometheus:
+        endpoint: 0.0.0.0:8889
+        add_metric_suffixes: false
+        resource_to_telemetry_conversion:
+          enabled: true
+
+    # ========================================
+    # SERVICE - Define data flow
+    # ========================================
+    service:
+      # Enable bearer token auth extension
+      extensions: [bearertokenauth]
+      
+      pipelines:
+        # Traces pipeline: Receive → Process → Export to Tempo + Generate Metrics
+        traces:
+          receivers: [otlp, jaeger, zipkin]
+          processors: [memory_limiter, batch]
+          exporters: [otlp, spanmetrics]
+        
+        # Metrics pipeline: Receive from spanmetrics → Export to Prometheus
+        metrics:
+          receivers: [spanmetrics]
+          exporters: [prometheus]
+EOF
+```
+
+**Verify OTel Collector:**
+
+```bash
+# Check pod is running
+oc get pods -n opentelemetrycollector
+
+# Check logs for bearer token auth
+oc logs -n opentelemetrycollector -l app.kubernetes.io/component=opentelemetry-collector | grep bearertokenauth
+
+# Should see:
+# "bearertokenauth extension started"
+# "refresh token from /var/run/secrets/kubernetes.io/serviceaccount/token"
+```
+
+---
+
+### Step 7: Enable OpenShift Traces UI
+
+```bash
+oc create -f - <<EOF
+apiVersion: observability.openshift.io/v1alpha1
+kind: UIPlugin
+metadata:
+  name: distributed-tracing
+spec:
+  type: DistributedTracing
+EOF
+```
+
+**Refresh your OpenShift Console browser** and navigate to:
+- **Observe** → **Traces**
+
+You should now see the Traces UI with:
+- TempoStack: `sample`
+- Tenants: `dev`, `prod`
+
+---
+
+### Step 8: Create Instrumentation Resource
+
+```bash
+oc create -f - <<'EOF'
+apiVersion: opentelemetry.io/v1alpha1
+kind: Instrumentation
+metadata:
+  name: auto-instrumentation
+  namespace: opentelemetrycollector
+spec:
+  # Where to send traces - points to OTel Collector
+  exporter:
+    endpoint: http://otel-collector.opentelemetrycollector.svc.cluster.local:4318
+  
+  # Trace context propagation formats
+  propagators:
+    - tracecontext
+    - baggage
+    - b3
+  
+  # Sampling configuration (100% sampling)
+  sampler:
+    type: parentbased_traceidratio
+    argument: "1.0"
+  
+  # Java auto-instrumentation
+  java:
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-java:latest
+    env:
+      - name: OTEL_EXPORTER_OTLP_TIMEOUT
+        value: "20000"
+      - name: OTEL_TRACES_EXPORTER
+        value: otlp
+      - name: OTEL_METRICS_EXPORTER
+        value: none
+      - name: OTEL_LOGS_EXPORTER
+        value: none
+  
+  # Python auto-instrumentation
+  python:
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-python:latest
+    env:
+      - name: OTEL_EXPORTER_OTLP_TIMEOUT
+        value: "20"
+      - name: OTEL_TRACES_EXPORTER
+        value: otlp
+      - name: OTEL_METRICS_EXPORTER
+        value: none
+      - name: OTEL_LOGS_EXPORTER
+        value: none
+  
+  # Node.js auto-instrumentation
+  nodejs:
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-nodejs:latest
+    env:
+      - name: OTEL_EXPORTER_OTLP_TIMEOUT
+        value: "20000"
+      - name: OTEL_TRACES_EXPORTER
+        value: otlp
+      - name: OTEL_METRICS_EXPORTER
+        value: none
+      - name: OTEL_LOGS_EXPORTER
+        value: none
+  
+  # .NET auto-instrumentation
+  dotnet:
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-dotnet:latest
+    env:
+      - name: OTEL_EXPORTER_OTLP_TIMEOUT
+        value: "20000"
+      - name: OTEL_TRACES_EXPORTER
+        value: otlp
+      - name: OTEL_METRICS_EXPORTER
+        value: none
+      - name: OTEL_LOGS_EXPORTER
+        value: none
+EOF
+```
+
+**Verify Instrumentation:**
+
+```bash
 oc get instrumentation -n opentelemetrycollector
-
-# Describe it
 oc describe instrumentation auto-instrumentation -n opentelemetrycollector
 ```
 
-## Step 8: Instrument Your Applications
+---
 
-### Option A: Namespace-Level Instrumentation (For Single-Container Pods)
+## Instrumentation Guide
 
-Instrument **all applications** in a namespace:
+### Understanding Auto-Instrumentation
 
-#### For Java Applications:
-```bash
-oc annotate namespace <your-namespace> \
-  instrumentation.opentelemetry.io/inject-java="opentelemetrycollector/auto-instrumentation"
-```
+The OpenTelemetry Operator can automatically inject tracing into your applications without code changes by:
+1. Adding an init container that downloads the OpenTelemetry SDK
+2. Setting environment variables to configure the SDK
+3. Instrumenting your application at startup
 
-#### For Python Applications:
+### Option A: Single-Container Pods (Namespace-Level)
+
+**For Python applications:**
 ```bash
 oc annotate namespace <your-namespace> \
   instrumentation.opentelemetry.io/inject-python="opentelemetrycollector/auto-instrumentation"
 ```
 
-#### For Node.js Applications:
+**For Java applications:**
+```bash
+oc annotate namespace <your-namespace> \
+  instrumentation.opentelemetry.io/inject-java="opentelemetrycollector/auto-instrumentation"
+```
+
+**For Node.js applications:**
 ```bash
 oc annotate namespace <your-namespace> \
   instrumentation.opentelemetry.io/inject-nodejs="opentelemetrycollector/auto-instrumentation"
 ```
 
-#### For .NET Applications:
+**For .NET applications:**
 ```bash
 oc annotate namespace <your-namespace> \
   instrumentation.opentelemetry.io/inject-dotnet="opentelemetrycollector/auto-instrumentation"
 ```
 
-#### For Multiple Languages in Same Namespace:
+### Option B: Multi-Container Pods (Deployment-Level) ⭐ RECOMMENDED
+
+**⚠️ IMPORTANT**: If your pods have multiple containers (e.g., app + oauth-proxy, app + istio-proxy), you **MUST** use deployment-level annotations with container targeting!
+
+#### Step 1: Identify Container Names
+
 ```bash
-oc annotate namespace <your-namespace> \
-  instrumentation.opentelemetry.io/inject-java="opentelemetrycollector/auto-instrumentation" \
-  instrumentation.opentelemetry.io/inject-python="opentelemetrycollector/auto-instrumentation" \
-  instrumentation.opentelemetry.io/inject-nodejs="opentelemetrycollector/auto-instrumentation"
-```
-
-### Option B: Deployment-Level Instrumentation
-
-Instrument a **specific deployment**:
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: my-app
-  namespace: my-app-namespace
-spec:
-  template:
-    metadata:
-      annotations:
-        # For Java apps
-        instrumentation.opentelemetry.io/inject-java: "opentelemetrycollector/auto-instrumentation"
-        
-        # For Python apps
-        # instrumentation.opentelemetry.io/inject-python: "opentelemetrycollector/auto-instrumentation"
-        
-        # For Node.js apps
-        # instrumentation.opentelemetry.io/inject-nodejs: "opentelemetrycollector/auto-instrumentation"
-    spec:
-      containers:
-      - name: my-app
-        image: my-app:latest
-```
-
-### Option C: Multi-Container Pods (IMPORTANT!)
-
-⚠️ **When your pods have multiple containers** (e.g., app + oauth-proxy, app + istio-proxy), namespace-level annotations will fail with:
-```
-ERROR: "incorrect instrumentation configuration - please provide container names for all instrumentations"
-```
-
-**Solution**: Use deployment-level annotations with **container-specific targeting**.
-
-#### Step 1: Check Container Names
-```bash
-# First, identify the container names in your deployment
 oc get deployment <deployment-name> -n <namespace> -o jsonpath='{.spec.template.spec.containers[*].name}'
-# Example output: my-app-container oauth-proxy
+# Example output: kserve-container oauth-proxy
 ```
 
-#### Step 2: Apply Container-Specific Instrumentation
+#### Step 2: Apply Instrumentation with Container Targeting
 
-##### Python Application with Multiple Containers:
+**Python application with multiple containers:**
 ```bash
 oc patch deployment <deployment-name> -n <namespace> --type=merge -p '{
   "spec": {
@@ -163,7 +580,7 @@ oc patch deployment <deployment-name> -n <namespace> --type=merge -p '{
 }'
 ```
 
-##### Java Application with Multiple Containers:
+**Java application:**
 ```bash
 oc patch deployment <deployment-name> -n <namespace> --type=merge -p '{
   "spec": {
@@ -179,44 +596,11 @@ oc patch deployment <deployment-name> -n <namespace> --type=merge -p '{
 }'
 ```
 
-##### Node.js Application with Multiple Containers:
+**Real-world example (KServe with oauth-proxy):**
 ```bash
-oc patch deployment <deployment-name> -n <namespace> --type=merge -p '{
-  "spec": {
-    "template": {
-      "metadata": {
-        "annotations": {
-          "instrumentation.opentelemetry.io/inject-nodejs": "opentelemetrycollector/auto-instrumentation",
-          "instrumentation.opentelemetry.io/nodejs-container-names": "<your-app-container-name>"
-        }
-      }
-    }
-  }
-}'
-```
-
-##### .NET Application with Multiple Containers:
-```bash
-oc patch deployment <deployment-name> -n <namespace> --type=merge -p '{
-  "spec": {
-    "template": {
-      "metadata": {
-        "annotations": {
-          "instrumentation.opentelemetry.io/inject-dotnet": "opentelemetrycollector/auto-instrumentation",
-          "instrumentation.opentelemetry.io/dotnet-container-names": "<your-app-container-name>"
-        }
-      }
-    }
-  }
-}'
-```
-
-#### Real-World Example:
-```bash
-# Example: KServe deployment with oauth-proxy sidecar
 # Container names: kserve-container, oauth-proxy
+# Instrument only kserve-container, not oauth-proxy
 
-# Instrument only the kserve-container (not oauth-proxy)
 oc patch deployment llama-predictor -n model --type=merge -p '{
   "spec": {
     "template": {
@@ -231,153 +615,166 @@ oc patch deployment llama-predictor -n model --type=merge -p '{
 }'
 ```
 
-**Key Points:**
-- ✅ Use `<language>-container-names` annotation to specify which container to instrument
-- ✅ This prevents instrumenting sidecar containers (oauth-proxy, istio-proxy, etc.)
-- ✅ Required for KServe, Istio, Service Mesh, and other multi-container deployments
-- ✅ The container name must match exactly what's in your deployment spec
+### Option C: YAML-Based Deployment
 
-### Option D: Manual Configuration (No Auto-Instrumentation)
-
-Configure applications manually to send traces:
-
-#### Environment Variables:
 ```yaml
-env:
-  # OTLP gRPC
-  - name: OTEL_EXPORTER_OTLP_ENDPOINT
-    value: "http://otel-collector.opentelemetrycollector.svc.cluster.local:4317"
-  
-  # OR OTLP HTTP
-  - name: OTEL_EXPORTER_OTLP_ENDPOINT
-    value: "http://otel-collector.opentelemetrycollector.svc.cluster.local:4318"
-  
-  # Service name
-  - name: OTEL_SERVICE_NAME
-    value: "my-service"
-  
-  # Traces exporter
-  - name: OTEL_TRACES_EXPORTER
-    value: "otlp"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  namespace: my-namespace
+spec:
+  template:
+    metadata:
+      annotations:
+        # For Python apps with multiple containers
+        instrumentation.opentelemetry.io/inject-python: "opentelemetrycollector/auto-instrumentation"
+        instrumentation.opentelemetry.io/python-container-names: "app-container"
+    spec:
+      containers:
+      - name: app-container
+        image: my-app:latest
+      - name: oauth-proxy
+        image: oauth-proxy:latest
+```
+
+### Restart Applications
+
+After adding instrumentation annotations:
+
+```bash
+# Restart specific deployment
+oc rollout restart deployment <deployment-name> -n <namespace>
+
+# Or restart all deployments in namespace
+oc rollout restart deployment -n <namespace>
 ```
 
 ---
 
-## Step 9: Restart Applications
+## Verification & Troubleshooting
 
-After adding annotations, restart your applications:
+### Verify Complete Setup
 
 ```bash
-# Restart all deployments in a namespace
-oc rollout restart deployment -n <your-namespace>
+# 1. Check TempoStack is ready
+oc get tempostack sample -n tracing-system
+# Status should be "Ready"
 
-# Or restart a specific deployment
-oc rollout restart deployment <deployment-name> -n <your-namespace>
+# 2. Check all Tempo pods are running
+oc get pods -n tracing-system
+# All pods should be "Running"
+
+# 3. Check Gateway is present
+oc get pods -n tracing-system -l app.kubernetes.io/component=gateway
+# Should see tempo-sample-gateway pod
+
+# 4. Check RBAC is configured
+oc get clusterrole tempostack-traces-reader tempostack-traces-write
+oc get clusterrolebinding tempostack-traces-reader tempostack-traces-write
+
+# 5. Check OTel Collector is running with bearer token auth
+oc logs -n opentelemetrycollector -l app.kubernetes.io/component=opentelemetry-collector | grep bearertokenauth
+# Should see: "bearertokenauth extension started"
+
+# 6. Check UIPlugin is active
+oc get uiplugin distributed-tracing
+# Should exist
 ```
 
----
-
-## Step 10: Verify Instrumentation
-
-### Check if Init Container is Injected
+### Verify Instrumentation
 
 ```bash
-# Get pods in your namespace
-oc get pods -n <your-namespace>
-
-# Check for OpenTelemetry init container
-oc get pod <pod-name> -n <your-namespace> -o jsonpath='{.spec.initContainers[*].name}'
+# Check if init container is injected
+oc get pod <pod-name> -n <namespace> -o jsonpath='{.spec.initContainers[*].name}'
 # Should show: opentelemetry-auto-instrumentation-<language>
+
+# Check environment variables
+oc exec -n <namespace> <pod-name> -c <container-name> -- env | grep OTEL
+# Should see OTEL_* variables
 ```
 
-### Check OpenTelemetry Environment Variables
+### Check Trace Flow
 
 ```bash
-# Check environment variables in your application container
-oc exec -n <your-namespace> <pod-name> -c <container-name> -- env | grep OTEL
+# 1. Check OTel Collector logs
+oc logs -n opentelemetrycollector -l app.kubernetes.io/component=opentelemetry-collector --tail=50
 
-# You should see:
-# OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.opentelemetrycollector.svc.cluster.local:4318
-# OTEL_TRACES_EXPORTER=otlp
-# OTEL_TRACES_SAMPLER=parentbased_traceidratio
-# OTEL_TRACES_SAMPLER_ARG=1.0
+# 2. Check Gateway logs
+oc logs -n tracing-system -l app.kubernetes.io/component=gateway --tail=50
+# Should see POST requests, NOT "TLS handshake error"
+
+# 3. Check Distributor logs
+oc logs -n tracing-system -l app.kubernetes.io/component=distributor --tail=50
+
+# 4. Check Ingester logs
+oc logs -n tracing-system -l app.kubernetes.io/component=ingester --tail=50
 ```
 
-### Check OTel Collector Logs
+### View Traces in UI
 
+1. Open **OpenShift Console**
+2. Navigate to **Observe** → **Traces**
+3. Select **TempoStack**: `sample`
+4. Select **Tenant**: `dev`
+5. Set time range: **Last 15 minutes**
+6. Click **Run Query**
+
+You should see traces in the scatter plot and table!
+
+### Common Issues
+
+#### Issue 1: "No Tempo instances" in Traces UI
+
+**Cause**: Gateway not enabled or multi-tenancy not configured
+
+**Solution**: Verify TempoStack configuration:
 ```bash
-# Check if OTel Collector is receiving traces
-oc logs -n opentelemetrycollector deployment/otel-collector -f
+oc get tempostack sample -n tracing-system -o yaml | grep -A 10 gateway
+oc get tempostack sample -n tracing-system -o yaml | grep -A 10 tenants
 ```
 
-### Check Tempo Ingester
+Both `gateway.enabled: true` and `tenants.mode: openshift` must be present.
 
+#### Issue 2: "TLS handshake error" in Gateway logs
+
+**Cause**: Missing RBAC or bearer token authentication
+
+**Solution**: 
+1. Verify RBAC ClusterRoles exist
+2. Verify OTel Collector has bearer token auth configured
+3. Restart OTel Collector:
 ```bash
-# Check if Tempo is receiving traces
-oc logs -n tracing-system tempo-simplest-ingester-0 -f
+oc delete pod -l app.kubernetes.io/component=opentelemetry-collector -n opentelemetrycollector
 ```
 
-### Troubleshoot Operator Issues
+#### Issue 3: Init container not injected
 
-```bash
-# Check OpenTelemetry Operator logs
-oc logs -n openshift-opentelemetry-operator deployment/opentelemetry-operator-controller-manager -f | grep -i error
-```
-
----
-
-## Troubleshooting
-
-### Issue 1: "incorrect instrumentation configuration - please provide container names"
-
-**Cause**: Your pod has multiple containers and namespace-level annotation doesn't specify which to instrument.
-
-**Solution**: Use deployment-level annotations with container names (see Option C: Multi-Container Pods above).
-
-### Issue 2: Init container not injected
-
-**Cause**: Instrumentation resource not found or wrong namespace reference.
+**Cause**: Incorrect annotation format or multi-container pod without container targeting
 
 **Solution**:
+1. For multi-container pods, use `<language>-container-names` annotation
+2. Verify annotation format:
 ```bash
-# Verify Instrumentation resource exists
-oc get instrumentation -n opentelemetrycollector
-
-# Check annotation format (must match exactly)
-oc get deployment <deployment-name> -n <namespace> -o yaml | grep instrumentation
+oc get deployment <name> -n <namespace> -o yaml | grep instrumentation
 ```
 
-### Issue 3: Traces not appearing in Tempo
+#### Issue 4: Traces not appearing in UI
 
-**Cause**: Network connectivity or configuration issue.
+**Cause**: No application traffic or instrumentation not working
 
 **Solution**:
-```bash
-# Test connectivity from OTel Collector to Tempo
-oc exec -n opentelemetrycollector deployment/otel-collector -- curl -v tempo-simplest-distributor.tracing-system.svc.cluster.local:4317
+1. Generate traffic to your application
+2. Check OTel Collector logs for trace activity
+3. Verify init container is present in pod
+4. Check application logs for OpenTelemetry initialization
 
-# Check OTel Collector logs for errors
-oc logs -n opentelemetrycollector deployment/otel-collector | grep -i error
-```
-
-### Issue 4: Istio injection conflict
-
-**Cause**: Namespace has `istio-injection: enabled` label but Istio is not installed or misconfigured.
-
-**Solution**:
-```bash
-# Check if namespace has Istio label
-oc get namespace <namespace> -o yaml | grep istio
-
-# Remove Istio injection label if not needed
-oc label namespace <namespace> istio-injection-
-```
-
-### Issue 5: Remove Instrumentation
+#### Issue 5: Remove instrumentation
 
 ```bash
 # Remove namespace annotation
-oc annotate namespace <namespace> instrumentation.opentelemetry.io/inject-python-
+oc annotate namespace <namespace> \
+  instrumentation.opentelemetry.io/inject-python-
 
 # Remove deployment annotation
 oc patch deployment <deployment-name> -n <namespace> --type=json -p '[
@@ -388,75 +785,51 @@ oc patch deployment <deployment-name> -n <namespace> --type=json -p '[
 
 ---
 
-## Architecture Overview
+## Key Differences from Basic Setup
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Your Applications (Python/Java/Node.js/.NET)              │
-│  - Automatically instrumented via OpenTelemetry Operator   │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-                      │ OTLP/HTTP (Port 4318) or OTLP/gRPC (Port 4317)
-                      ↓
-┌─────────────────────────────────────────────────────────────┐
-│  OpenTelemetry Collector (opentelemetrycollector namespace) │
-│  - Receives: OTLP, Jaeger, Zipkin                          │
-│  - Processes: batch, memory_limiter                         │
-│  - Generates: Span metrics                                  │
-│  - Exports: Traces to Tempo, Metrics to Prometheus         │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-                      │ OTLP/gRPC (Port 4317)
-                      ↓
-┌─────────────────────────────────────────────────────────────┐
-│  Tempo Distributor (tracing-system namespace)               │
-│  Service: tempo-simplest-distributor                        │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-                      ↓
-┌─────────────────────────────────────────────────────────────┐
-│  Tempo Ingester                                             │
-│  Writes traces to S3 (MinIO/AWS)                           │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-                      ↓
-┌─────────────────────────────────────────────────────────────┐
-│  S3 Storage (AWS/MinIO)                                     │
-│  Bucket: tempo-traces                                       │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-                      ↓
-┌─────────────────────────────────────────────────────────────┐
-│  Query Traces                                               │
-│  - Tempo Query Frontend                                     │
-│  - Grafana (with Tempo datasource)                         │
-│  - Jaeger UI (via TempoStack)                              │
-└─────────────────────────────────────────────────────────────┘
-```
+This setup includes **critical components** required for the OpenShift Traces UI that are often missing in basic guides:
+
+1. ✅ **Gateway enabled** - Required for Traces UI discovery
+2. ✅ **Multi-tenancy** (`mode: openshift`) - Required for Traces UI
+3. ✅ **RBAC for reading traces** - Without this, UI shows empty
+4. ✅ **RBAC for writing traces** - Without this, OTel can't send traces
+5. ✅ **Bearer token authentication** - Required for Gateway communication
+6. ✅ **UIPlugin resource** - Enables Traces UI in console
+7. ✅ **Container-specific instrumentation** - For multi-container pods
 
 ---
 
-## Quick Reference
+## Quick Reference Commands
 
-### Check Container Names
+### Setup
 ```bash
-oc get deployment <deployment-name> -n <namespace> -o jsonpath='{.spec.template.spec.containers[*].name}'
+# Create namespaces
+oc new-project tracing-system
+oc new-project opentelemetrycollector
+
+# Apply all resources
+oc apply -f metrics-tempo-s3_final.yaml      # S3 secret
+oc apply -f tempostack.yaml                   # TempoStack (with gateway)
+oc apply -f rbac-traces-reader.yaml           # RBAC for users
+oc apply -f rbac-traces-writer.yaml           # RBAC for OTel
+oc apply -f OpenTelemetry_new                 # OTel Collector (with auth)
+oc apply -f instrumentation.yaml              # Instrumentation resource
+oc apply -f uiplugin                          # UI Plugin
 ```
 
-### Instrument Single-Container Pod (Namespace-Level)
+### Instrumentation
 ```bash
-oc annotate namespace <namespace> instrumentation.opentelemetry.io/inject-python="opentelemetrycollector/auto-instrumentation"
-```
+# Single-container (namespace-level)
+oc annotate namespace <ns> instrumentation.opentelemetry.io/inject-python="opentelemetrycollector/auto-instrumentation"
 
-### Instrument Multi-Container Pod (Deployment-Level)
-```bash
-oc patch deployment <deployment-name> -n <namespace> --type=merge -p '{
+# Multi-container (deployment-level)
+oc patch deployment <deploy> -n <ns> --type=merge -p '{
   "spec": {
     "template": {
       "metadata": {
         "annotations": {
           "instrumentation.opentelemetry.io/inject-python": "opentelemetrycollector/auto-instrumentation",
-          "instrumentation.opentelemetry.io/python-container-names": "<container-name>"
+          "instrumentation.opentelemetry.io/python-container-names": "<container>"
         }
       }
     }
@@ -464,29 +837,40 @@ oc patch deployment <deployment-name> -n <namespace> --type=merge -p '{
 }'
 ```
 
-### Restart Deployment
+### Verification
 ```bash
-oc rollout restart deployment <deployment-name> -n <namespace>
-```
+# Check everything
+oc get tempostack -n tracing-system
+oc get pods -n tracing-system
+oc get clusterrole tempostack-traces-reader tempostack-traces-write
+oc get pods -n opentelemetrycollector
+oc get uiplugin
 
-### Verify Init Container
-```bash
-oc get pod <pod-name> -n <namespace> -o jsonpath='{.spec.initContainers[*].name}'
-```
-
-### Check Traces
-```bash
-# OTel Collector logs
-oc logs -n opentelemetrycollector deployment/otel-collector -f
-
-# Tempo ingester logs
-oc logs -n tracing-system tempo-simplest-ingester-0 -f
+# Check logs
+oc logs -n opentelemetrycollector -l app.kubernetes.io/component=opentelemetry-collector
+oc logs -n tracing-system -l app.kubernetes.io/component=gateway
 ```
 
 ---
 
 ## References
 
-- [OpenShift Distributed Tracing with Tempo](https://docs.openshift.com/container-platform/4.13/observability/distr_tracing/distr_tracing_tempo/distr-tracing-tempo-configuring.html)
-- [OpenTelemetry Operator Documentation](https://github.com/open-telemetry/opentelemetry-operator)
+- [OpenShift Distributed Tracing with Tempo (Official)](https://docs.openshift.com/container-platform/4.13/observability/distr_tracing/distr_tracing_tempo/distr-tracing-tempo-configuring.html)
+- [Cluster Observability Operator](https://docs.openshift.com/container-platform/4.18/html-single/cluster_observability_operator/index)
+- [New Traces UI Blog Post](https://developers.redhat.com/articles/2024/07/10/introducing-new-traces-ui-red-hat-openshift-web-console)
+- [OpenTelemetry Operator](https://github.com/open-telemetry/opentelemetry-operator)
 - [Grafana Tempo Documentation](https://grafana.com/docs/tempo/latest/)
+- [Tempo Operator GitHub](https://github.com/grafana/tempo-operator)
+
+---
+
+## Credits
+
+This guide consolidates best practices from:
+- Red Hat OpenShift documentation
+- Grafana Tempo Operator documentation
+- OpenTelemetry Operator documentation
+- Real-world production deployments
+
+**Last Updated**: October 2025  
+**Tested on**: OpenShift 4.18 on AWS ROSA
