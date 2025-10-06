@@ -26,7 +26,7 @@ spec:
           enabled: true # by default resource attributes are dropped
 
       otlp:
-        endpoint: "tempo-ssmple-distributor.tracing-system.svc.cluster.local:4317"
+        endpoint: "tempo-sample-distributor.tracing-system.svc.cluster.local:4317"
         tls:
           insecure: true
 
