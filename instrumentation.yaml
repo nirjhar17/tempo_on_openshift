@@ -1,0 +1,72 @@
+apiVersion: opentelemetry.io/v1alpha1
+kind: Instrumentation
+metadata:
+  name: auto-instrumentation
+  namespace: opentelemetrycollector
+spec:
+  # Where to send traces - points to OTel Collector
+  exporter:
+    endpoint: http://otel-collector.opentelemetrycollector.svc.cluster.local:4318
+  
+  # Trace context propagation formats
+  propagators:
+    - tracecontext
+    - baggage
+    - b3
+  
+  # Sampling configuration (100% sampling)
+  sampler:
+    type: parentbased_traceidratio
+    argument: "1.0"
+  
+  # Java auto-instrumentation
+  java:
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-java:latest
+    env:
+      - name: OTEL_EXPORTER_OTLP_TIMEOUT
+        value: "20000"
+      - name: OTEL_TRACES_EXPORTER
+        value: otlp
+      - name: OTEL_METRICS_EXPORTER
+        value: none
+      - name: OTEL_LOGS_EXPORTER
+        value: none
+  
+  # Python auto-instrumentation
+  python:
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-python:latest
+    env:
+      - name: OTEL_EXPORTER_OTLP_TIMEOUT
+        value: "20"
+      - name: OTEL_TRACES_EXPORTER
+        value: otlp
+      - name: OTEL_METRICS_EXPORTER
+        value: none
+      - name: OTEL_LOGS_EXPORTER
+        value: none
+  
+  # Node.js auto-instrumentation
+  nodejs:
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-nodejs:latest
+    env:
+      - name: OTEL_EXPORTER_OTLP_TIMEOUT
+        value: "20000"
+      - name: OTEL_TRACES_EXPORTER
+        value: otlp
+      - name: OTEL_METRICS_EXPORTER
+        value: none
+      - name: OTEL_LOGS_EXPORTER
+        value: none
+  
+  # .NET auto-instrumentation
+  dotnet:
+    image: ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-dotnet:latest
+    env:
+      - name: OTEL_EXPORTER_OTLP_TIMEOUT
+        value: "20000"
+      - name: OTEL_TRACES_EXPORTER
+        value: otlp
+      - name: OTEL_METRICS_EXPORTER
+        value: none
+      - name: OTEL_LOGS_EXPORTER
+        value: none
