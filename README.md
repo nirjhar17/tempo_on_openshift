@@ -47,3 +47,122 @@ spec:
           type: route
 
 ```
+### 7. Apply the Configuration
+
+```bash
+oc apply -f instrumentation.yaml
+```
+
+```bash
+# Check Instrumentation resource
+oc get instrumentation -n opentelemetrycollector
+
+# Describe it
+oc describe instrumentation auto-instrumentation -n opentelemetrycollector
+```
+
+## Step 8: Instrument Your Applications
+
+### Option A: Namespace-Level Instrumentation (Recommended)
+
+Instrument **all applications** in a namespace:
+
+#### For Java Applications:
+```bash
+oc annotate namespace <your-namespace> \
+  instrumentation.opentelemetry.io/inject-java="opentelemetrycollector/auto-instrumentation"
+```
+
+#### For Python Applications:
+```bash
+oc annotate namespace <your-namespace> \
+  instrumentation.opentelemetry.io/inject-python="opentelemetrycollector/auto-instrumentation"
+```
+
+#### For Node.js Applications:
+```bash
+oc annotate namespace <your-namespace> \
+  instrumentation.opentelemetry.io/inject-nodejs="opentelemetrycollector/auto-instrumentation"
+```
+
+#### For .NET Applications:
+```bash
+oc annotate namespace <your-namespace> \
+  instrumentation.opentelemetry.io/inject-dotnet="opentelemetrycollector/auto-instrumentation"
+```
+
+#### For Multiple Languages in Same Namespace:
+```bash
+oc annotate namespace <your-namespace> \
+  instrumentation.opentelemetry.io/inject-java="opentelemetrycollector/auto-instrumentation" \
+  instrumentation.opentelemetry.io/inject-python="opentelemetrycollector/auto-instrumentation" \
+  instrumentation.opentelemetry.io/inject-nodejs="opentelemetrycollector/auto-instrumentation"
+```
+
+### Option B: Deployment-Level Instrumentation
+
+Instrument a **specific deployment**:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  namespace: my-app-namespace
+spec:
+  template:
+    metadata:
+      annotations:
+        # For Java apps
+        instrumentation.opentelemetry.io/inject-java: "opentelemetrycollector/auto-instrumentation"
+        
+        # For Python apps
+        # instrumentation.opentelemetry.io/inject-python: "opentelemetrycollector/auto-instrumentation"
+        
+        # For Node.js apps
+        # instrumentation.opentelemetry.io/inject-nodejs: "opentelemetrycollector/auto-instrumentation"
+    spec:
+      containers:
+      - name: my-app
+        image: my-app:latest
+```
+
+### Option C: Manual Configuration (No Auto-Instrumentation)
+
+Configure applications manually to send traces:
+
+#### Environment Variables:
+```yaml
+env:
+  # OTLP gRPC
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: "http://otel-collector.opentelemetrycollector.svc.cluster.local:4317"
+  
+  # OR OTLP HTTP
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: "http://otel-collector.opentelemetrycollector.svc.cluster.local:4318"
+  
+  # Service name
+  - name: OTEL_SERVICE_NAME
+    value: "my-service"
+  
+  # Traces exporter
+  - name: OTEL_TRACES_EXPORTER
+    value: "otlp"
+```
+
+---
+
+## Step 9: Restart Applications
+
+After adding annotations, restart your applications:
+
+```bash
+# Restart all deployments in a namespace
+oc rollout restart deployment -n <your-namespace>
+
+# Or restart a specific deployment
+oc rollout restart deployment <deployment-name> -n <your-namespace>
+```
+
+---
