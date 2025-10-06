@@ -1,0 +1,124 @@
+apiVersion: opentelemetry.io/v1alpha1
+kind: OpenTelemetryCollector
+metadata:
+  name: otel
+  namespace: opentelemetrycollector
+spec:
+  mode: deployment
+  replicas: 1
+  
+  # Enable metrics for observability
+  observability:
+    metrics:
+      enableMetrics: true
+  
+  # Main configuration
+  config: |
+    # Receivers - accept traces from applications
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+      
+      # Optional: Jaeger receiver for legacy apps
+      jaeger:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:14250
+          thrift_http:
+            endpoint: 0.0.0.0:14268
+          thrift_compact:
+            endpoint: 0.0.0.0:6831
+          thrift_binary:
+            endpoint: 0.0.0.0:6832
+      
+      # Optional: Zipkin receiver
+      zipkin:
+        endpoint: 0.0.0.0:9411
+
+    # Processors - process and enrich traces
+    processors:
+      # Batch processor - batches traces for efficiency
+      batch:
+        timeout: 10s
+        send_batch_size: 1024
+      
+      # Memory limiter - prevents OOM
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 512
+        spike_limit_mib: 128
+      
+      # Resource processor - add resource attributes
+      resource:
+        attributes:
+          - key: cluster.name
+            value: openshift-cluster
+            action: upsert
+
+    # Connectors - generate metrics from spans
+    connectors:
+      spanmetrics:
+        metrics_flush_interval: 15s
+        dimensions:
+          - name: http.method
+            default: GET
+          - name: http.status_code
+          - name: service.name
+
+    # Exporters - send data to backends
+    exporters:
+      # Export traces to Tempo
+      otlp:
+        endpoint: "tempo-sample-distributor.tracing-system.svc.cluster.local:4317"
+        tls:
+          insecure: true
+        sending_queue:
+          enabled: true
+          num_consumers: 10
+          queue_size: 1000
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_interval: 30s
+          max_elapsed_time: 300s
+      
+      # Export span metrics to Prometheus
+      prometheus:
+        endpoint: 0.0.0.0:8889
+        namespace: otel
+        add_metric_suffixes: false
+        resource_to_telemetry_conversion:
+          enabled: true
+      
+      # Debug logging (optional - can be removed in production)
+      logging:
+        loglevel: info
+        sampling_initial: 5
+        sampling_thereafter: 200
+
+    # Service pipelines - define data flow
+    service:
+      pipelines:
+        # Traces pipeline
+        traces:
+          receivers: [otlp, jaeger, zipkin]
+          processors: [memory_limiter, resource, batch]
+          exporters: [otlp, spanmetrics, logging]
+        
+        # Metrics pipeline (from spans)
+        metrics:
+          receivers: [spanmetrics]
+          processors: [batch]
+          exporters: [prometheus]
+      
+      # Telemetry configuration
+      telemetry:
+        logs:
+          level: info
+        metrics:
+          level: detailed
+          address: 0.0.0.0:8888
